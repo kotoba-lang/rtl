@@ -11,7 +11,11 @@
 
 (deftest namespace-loads
   (testing "the restored CLJC namespace loads"
-    (is (some? (the-ns 'rtl)))))
+    ;; `the-ns` is JVM-only (no runtime namespace reflection in cljs) — the
+    ;; require of `rtl` above already proves cljs-side loadability at
+    ;; compile time, so this assertion is clj-only.
+    #?(:clj (is (some? (the-ns 'rtl)))
+       :cljs (is true))))
 
 ;; mirrors `test_parse_basic_verilog_module`
 (deftest parse-basic-verilog-module
@@ -82,3 +86,117 @@
       (is (not (some #{:and} gate-types)))
       (is (some #{:or} gate-types))
       (is (some #{:dff} gate-types)))))
+
+;; ---------------------------------------------------------------------
+;; Extra coverage beyond the 1:1 Rust-parity tests above (found during
+;; ADR-2607010930's parallel restoration effort). Adapted to this repo's
+;; actual APIs — map-arg constructors (`rtl.hdl/rtl-port`,
+;; `rtl.hdl/rtl-module`), `[:ok ...]`/`[:error ...]` tuple returns from
+;; `rtl.hdl/parse-verilog`, and `rtl.synthesis/gate-netlist` — not copied
+;; verbatim from any other draft, which used a different (positional-arg,
+;; map-error) API shape.
+;; ---------------------------------------------------------------------
+
+(deftest parse-verilog-errors
+  (testing "missing 'module' keyword"
+    (is (= [:error "missing 'module' keyword"] (hdl/parse-verilog "endmodule"))))
+  (testing "missing 'endmodule'"
+    (is (= [:error "missing 'endmodule'"] (hdl/parse-verilog "module foo(a, b);"))))
+  (testing "empty module name"
+    (is (= [:error "empty module name"] (hdl/parse-verilog "module (a, b); endmodule")))))
+
+(deftest parse-verilog-no-ports
+  (let [[status [name ports]] (hdl/parse-verilog "module top; endmodule")]
+    (is (= :ok status))
+    (is (= "top" name))
+    (is (= [] ports))))
+
+(deftest bit-range-width
+  (is (= 8 (hdl/bit-range-width (hdl/bit-range 7 0))))
+  (is (= 1 (hdl/bit-range-width (hdl/bit-range-single)))))
+
+(deftest ast-constructors-roundtrip
+  (let [port (hdl/rtl-port {:name "clk" :direction :input
+                             :width (hdl/bit-range-single) :signal-type :wire})
+        assign (hdl/assign-stmt "out" (hdl/binary-op-expr :and (hdl/signal-expr "a") (hdl/signal-expr "b")))
+        module (hdl/rtl-module {:name "m" :ports [port] :parameters []
+                                 :instances []
+                                 :always-blocks [(hdl/combinational-block ["a" "b"] [assign])]
+                                 :assigns [(hdl/continuous-assign "y" (hdl/literal-expr 1))]})]
+    (is (= "clk" (:name port)))
+    (is (= :input (:direction port)))
+    (is (= :assign (:kind assign)))
+    (is (= "m" (:name module)))
+    (is (= 1 (count (:ports module))))
+    (is (= 1 (count (:always-blocks module))))
+    (is (= 1 (count (:assigns module))))))
+
+(deftest signal-state-construction
+  (is (= {:width 4 :values [:x :x :x :x]} (sim/signal-state 4)))
+  (is (= {:width 2 :values [:one :zero]}
+         (sim/signal-state-from-values [:one :zero]))))
+
+(deftest events-beyond-run-window-are-retained
+  (let [s0 (-> (sim/simulator)
+               (sim/register-signal "s" 1)
+               (sim/schedule-event 5 "s" [:one])
+               (sim/schedule-event 100 "s" [:zero]))
+        s1 (sim/run s0 10)]
+    (is (= 10 (:time s1)))
+    (is (= :one (first (:values (sim/get-signal s1 "s")))))
+    (is (= 1 (count (:event-queue s1))))
+    (is (= 100 (:time (first (:event-queue s1)))))))
+
+(deftest unregistered-signal-returns-nil
+  (let [s0 (sim/simulator)]
+    (is (nil? (sim/get-signal s0 "missing")))
+    (is (nil? (sim/get-signal-history s0 "missing")))))
+
+(deftest optimize-does-not-mutate-input
+  (let [netlist {:gates [(synthesis/gate :and ["1'b1" "1'b1"] "n1")
+                          (synthesis/gate :or ["n1" "a"] "n2")
+                          (synthesis/gate :dff ["n2"] "q")]
+                 :primary-inputs ["a" "1'b0" "1'b1"]
+                 :primary-outputs ["q"]}
+        _ (synthesis/optimize netlist)]
+    (is (= 3 (count (:gates netlist))))))
+
+(deftest optimize-folds-chained-constants
+  (let [netlist {:gates [(synthesis/gate :not ["1'b0"] "n1")
+                          (synthesis/gate :and ["n1" "1'b1"] "n2")
+                          (synthesis/gate :buf ["n2"] "out")]
+                 :primary-inputs ["1'b0" "1'b1"]
+                 :primary-outputs ["out"]}
+        optimized (synthesis/optimize netlist)]
+    (is (= 0 (count (:gates optimized))))))
+
+(deftest gate-netlist-is-empty
+  (let [netlist (synthesis/gate-netlist)]
+    (is (= 0 (:gate-count (synthesis/stats netlist))))
+    (is (= [] (:gates (synthesis/optimize netlist))))))
+
+(deftest vcd-export-multi-bit-signal
+  (let [signals [(waveform/waveform-signal
+                  {:name "data" :width 4
+                   :transitions [[0 "0000"] [3 "1010"]]
+                   :display-format :hex :color "#ff0000"})]
+        vcd (waveform/export-vcd signals)]
+    (is (str/includes? vcd "$var wire 4"))
+    (is (str/includes? vcd "b0000 "))
+    (is (str/includes? vcd "b1010 "))))
+
+(deftest vcd-export-no-transitions-defaults-to-x
+  (let [signals [(waveform/waveform-signal
+                  {:name "u" :width 1 :transitions []
+                   :display-format :binary :color "#000000"})]
+        vcd (waveform/export-vcd signals)]
+    (is (str/includes? vcd "x!"))))
+
+(deftest waveform-view-add-signal-updates-time-range
+  (let [view (-> (waveform/waveform-view)
+                 (waveform/add-signal
+                  (waveform/waveform-signal
+                   {:name "a" :width 1 :transitions [[0 "0"] [7 "1"]]
+                    :display-format :binary :color "#fff"})))]
+    (is (= [0 7] (:time-range view)))
+    (is (= 1 (count (:signals view))))))
