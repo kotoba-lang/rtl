@@ -15,9 +15,12 @@ viewer, and synthesis netlist.
 | `rtl.waveform` | `waveform` | Waveform view + IEEE 1364 VCD (Value Change Dump) export |
 | `rtl.synthesis` | `synthesis` | Gate-level netlist, memoized combinational-depth estimation, constant-folding optimization |
 | `rtl.eda-adapter` | new | Converts a `rtl.synthesis` gate-netlist into a `kotoba-lang/eda` static-timing-analysis job |
+| `rtl.vhdl-adapter` | new | Converts an `org-ieee-vhdl` entity/architecture into an `rtl.hdl` module/port, so VHDL sources drive the same pipeline as Verilog |
 
-Depends on `kotoba-lang/{engineer,engineer-render}` for shared contracts, and
-on `kotoba-lang/eda` (`:local/root "../eda"`) for `rtl.eda-adapter`.
+Depends on `kotoba-lang/{engineer,engineer-render}` for shared contracts, on
+`kotoba-lang/eda` (`:local/root "../eda"`) for `rtl.eda-adapter`, and on
+`kotoba-lang/org-ieee-vhdl` (`:local/root "../org-ieee-vhdl"`) for
+`rtl.vhdl-adapter`.
 
 ## Status
 
@@ -79,6 +82,55 @@ What IS approximated, and said plainly:
 
 Same alpha/prototype-grade maturity level as `kotoba-lang/eda` itself — see
 that repo's README coverage table.
+
+## VHDL frontend (`rtl.vhdl-adapter`)
+
+`rtl.hdl/parse-verilog` is Verilog-only. `rtl.vhdl-adapter` gives `rtl` a
+second frontend by converting [`kotoba-lang/org-ieee-vhdl`](https://github.com/kotoba-lang/org-ieee-vhdl)'s
+independent entity/architecture model (IEEE 1076 §3.2/§3.3) into the same
+`rtl.hdl/rtl-module`/`rtl-port` shape `parse-verilog` builds towards — so a
+VHDL source can drive the exact same synthesis/simulation/eda-timing
+pipeline as a Verilog one, through one uniform module representation.
+
+`parse-vhdl-source` mirrors `parse-verilog`'s API shape: `[:ok rtl-module]`
+on success, `[:error msg]` on failure (missing `entity` declaration or
+missing `end entity`), so callers don't need to branch on which HDL
+frontend produced the module they're holding.
+
+Direction mapping: VHDL's 4 port modes (`:in`/`:out`/`:inout`/`:buffer`)
+don't line up 1:1 with `rtl.hdl/port-directions`' 3-way scheme (`:input`/
+`:output`/`:inout`). `:in`/`:out`/`:inout` map directly; `:buffer` collapses
+to `:output` — a buffer port is still single-driver (driven only by this
+entity) exactly like `:out`, the only VHDL-specific wrinkle (its driven
+value may be read back inside the architecture) has no synthesis-pin-
+direction meaning, so it is not treated as `:inout`.
+
+Width comes from `vhdl.entity/bus-width`, which already parses vector types
+(`"std_logic_vector(7 downto 0)"` -> 8) and treats scalar types with no
+range (`std_logic`, `boolean`, ...) as width 1.
+
+```clojure
+(require '[rtl.vhdl-adapter :as vhdl-adapter])
+
+(vhdl-adapter/parse-vhdl-source
+ "entity and_gate is
+    port (
+      a : in std_logic;
+      b : in std_logic;
+      y : out std_logic;
+    );
+  end entity;")
+;; => [:ok {:name "and_gate"
+;;          :ports [{:name "a" :direction :input :width 1 :signal-type :logic}
+;;                   {:name "b" :direction :input :width 1 :signal-type :logic}
+;;                   {:name "y" :direction :output :width 1 :signal-type :logic}]
+;;          :parameters [] :instances [] :always-blocks [] :assigns []}]
+```
+
+`architecture->process-count` exposes a small piece of `vhdl.architecture`-
+derived info for synthesis-style reporting: given an architecture body's
+`:processes`, it returns `{:combinational n :sequential m}` using
+`vhdl.architecture/combinational?`'s clock-sensitivity heuristic.
 
 ## Develop
 
