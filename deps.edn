@@ -1,6 +1,6 @@
 {:paths ["src" "test"]
- :deps {io.github.kotoba-lang/eda {:local/root "../eda"}
-        io.github.kotoba-lang/org-ieee-vhdl {:local/root "../org-ieee-vhdl"}}
+ :deps {io.github.kotoba-lang/eda {:git/sha "3188eb6018246b83bd4c01b4c6beb5e487f6baa9"}
+        io.github.kotoba-lang/org-ieee-vhdl {:git/sha "6cd7436217d9d399e378716dcf9da9e02a011ed6"}}
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {io.github.cognitect-labs/test-runner
                                {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
